@@ -7,7 +7,11 @@ import { getClient } from ':store/chain-clients/utils.js';
 import { PublicClient, createPublicClient, http } from 'viem';
 import { Mock, beforeEach, describe, expect, it, vi } from 'vitest';
 import { multicall } from '../../multicall/index.js';
-import { timestampInSecondsToDate, toSpendPermissionArgs } from '../utils.js';
+import {
+  calculateCurrentPeriod,
+  timestampInSecondsToDate,
+  toSpendPermissionArgs,
+} from '../utils.js';
 import { getPublicClientFromChainId } from '../utils.node.js';
 import { GetPermissionStatusResponseType, getPermissionStatus } from './getPermissionStatus.js';
 
@@ -277,6 +281,36 @@ describe('getPermissionStatus - browser + node', () => {
       Date.now = originalDateNow;
     });
 
+    it.each([
+      ['after end', 1234654291, true],
+      ['exactly at end', 1234654290, true],
+      ['before start', 1234567889, false],
+    ])('should return a status when getCurrentPeriod reverts %s', async (_case, now, expired) => {
+      // SpendPermissionManager.getCurrentPeriod reverts outside [start, end)
+      const localPeriod = { start: 1234567890, end: 1234654290, spend: BigInt(0) };
+      (calculateCurrentPeriod as Mock).mockReturnValue(localPeriod);
+      const originalDateNow = Date.now;
+      Date.now = vi.fn(() => now * 1000);
+
+      (getClient as Mock).mockReturnValue(mockClient);
+      (multicall as Mock).mockResolvedValueOnce([
+        { status: 'failure' as const, error: new Error('AfterSpendPermissionEnd') },
+        { status: 'success' as const, result: false },
+        { status: 'success' as const, result: true },
+      ]);
+
+      const result = await getPermissionStatus(mockSpendPermission);
+
+      expect(calculateCurrentPeriod).toHaveBeenCalledWith(mockSpendPermission, now);
+      expect(result.currentPeriod).toEqual(localPeriod);
+      expect(result.remainingSpend).toBe(BigInt(0));
+      expect(result.isExpired).toBe(expired);
+      expect(result.isActive).toBe(!expired);
+      expect(result.isRevoked).toBe(false);
+
+      Date.now = originalDateNow;
+    });
+
     it('should handle different chain IDs correctly', async () => {
       const testChainIds = [1, 8453, 137, 42161];
 
@@ -404,6 +438,10 @@ describe('getPermissionStatus - browser + node', () => {
     });
 
     it('should handle multicall failure for getCurrentPeriod', async () => {
+      // Inside [start, end) the period comes from the chain, so a failure is an error
+      const originalDateNow = Date.now;
+      Date.now = vi.fn(() => 1234567890 * 1000);
+
       // Test with browser environment
       (getClient as Mock).mockReturnValue(mockClient);
       (multicall as Mock).mockResolvedValueOnce([
@@ -413,6 +451,8 @@ describe('getPermissionStatus - browser + node', () => {
       ]);
 
       await expect(getPermissionStatus(mockSpendPermission)).rejects.toThrow('Call 0 failed');
+
+      Date.now = originalDateNow;
     });
 
     it('should handle multicall failure for isRevoked', async () => {
@@ -499,6 +539,7 @@ describe('getPermissionStatus - browser + node', () => {
             'Failed to fetch revoked status',
             'Failed to fetch valid status',
           ],
+          allowPartialFailure: true,
         });
 
         // Restore Date.now

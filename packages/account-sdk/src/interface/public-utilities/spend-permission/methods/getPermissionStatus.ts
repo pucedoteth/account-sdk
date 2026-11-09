@@ -6,7 +6,11 @@ import {
 import { getClient } from ':store/chain-clients/utils.js';
 import { PublicClient, createPublicClient, http } from 'viem';
 import { multicall, unwrapMulticallResults } from '../../multicall/index.js';
-import { timestampInSecondsToDate, toSpendPermissionArgs } from '../utils.js';
+import {
+  calculateCurrentPeriod,
+  timestampInSecondsToDate,
+  toSpendPermissionArgs,
+} from '../utils.js';
 import { getPublicClientFromChainId } from '../utils.node.js';
 import { withTelemetry } from '../withTelemetry.js';
 
@@ -131,7 +135,23 @@ const getPermissionStatusFn = async (
       'Failed to fetch revoked status',
       'Failed to fetch valid status',
     ],
+    allowPartialFailure: true,
   });
+
+  // SpendPermissionManager.getCurrentPeriod reverts before `start` and from `end` on
+  // (BeforeSpendPermissionStart / AfterSpendPermissionEnd). Outside that window the period is
+  // computed locally, and nothing can be spent.
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  const outsideWindow =
+    currentTimestamp < Number(permission.permission.start) ||
+    currentTimestamp >= Number(permission.permission.end);
+  const periodFromChain = results[0].status === 'success';
+  if (!periodFromChain && outsideWindow) {
+    results[0] = {
+      status: 'success',
+      result: calculateCurrentPeriod(permission, currentTimestamp),
+    };
+  }
 
   // Extract results from multicall response
   const [currentPeriod, isRevoked, isValid] = unwrapMulticallResults<
@@ -145,15 +165,14 @@ const getPermissionStatusFn = async (
   // Calculate remaining spend in current period
   const allowance = BigInt(permission.permission.allowance);
   const spent = currentPeriod.spend;
-  const remainingSpend = allowance > spent ? allowance - spent : BigInt(0);
+  const remainingSpend = periodFromChain && allowance > spent ? allowance - spent : BigInt(0);
 
   // Calculate next period start
   // Next period starts immediately after current period ends
   const nextPeriodStart = (Number(currentPeriod.end) + 1).toString();
 
-  // Check if permission is expired
-  const currentTimestamp = Math.floor(Date.now() / 1000);
-  const isExpired = currentTimestamp > permission.permission.end;
+  // Check if permission is expired; the contract treats it as ended from `end` on
+  const isExpired = currentTimestamp >= permission.permission.end;
 
   // Permission is active if it's not revoked and not expired
   const isActive = !isRevoked && !isExpired;
